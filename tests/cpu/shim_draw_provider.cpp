@@ -45,16 +45,19 @@ extern "C" __declspec(dllexport) DWORD draw_request()
         if (!std::strcmp(mode, "two")) return 3;
         if (!std::strcmp(mode, "stale")) return 4;
         if (!std::strcmp(mode, "fail-second")) return 5;
+        if (!std::strcmp(mode, "texture")) return 7;
+        if (!std::strcmp(mode, "texture-stale")) return 9;
     }
     ExitProcess(21);
 }
 
 extern "C" __declspec(dllexport) DWORD draw_frame(DWORD mode)
 {
-    if (mode < 1 || mode > 6) ExitProcess(22);
+    if (mode < 1 || mode > 10) ExitProcess(22);
     if (mode >= 3) std::fprintf(stderr, "draw_frame mode=%lu\n", static_cast<unsigned long>(mode));
     std::vector<unsigned char> rgba;
     if (!shim_draw_gpu(mode, rgba) || rgba.size() != side * side * 4) return 0xFFFFFFFF;
     if (!publish(rgba.data(), static_cast<DWORD>(rgba.size()))) ExitProcess(23);
+    if (mode >= 7) return 0;  // The cross-runner reference checks all texture pixels.
     return mismatches(rgba, mode == 4 || mode == 5);
 }

@@ -1850,6 +1850,22 @@ if(EXISTS "${INTAKE_PYTHON}")
         COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E main -Fh "${shim_draw_color_header}" -Vn shim_draw_color
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/shim_draw_color.hlsl"
         DEPENDS tests/cpu/shim_draw_color.hlsl VERBATIM)
+    foreach(stage IN ITEMS texture_init texture_read texture_swap)
+        set(profile ps_6_0)
+        set(definition)
+        if(stage STREQUAL texture_init)
+            set(profile cs_6_0)
+            set(definition -DINITIALIZE_TEXTURE)
+        elseif(stage STREQUAL texture_swap)
+            set(definition -DSWAP_CHANNELS)
+        endif()
+        set(header "${CMAKE_CURRENT_BINARY_DIR}/shim_draw_${stage}.h")
+        add_custom_command(OUTPUT "${header}"
+            COMMAND "${DXC_EXECUTABLE}" -T "${profile}" -E main ${definition}
+                -Fh "${header}" -Vn "shim_draw_${stage}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/shim_draw_texture.hlsl"
+            DEPENDS tests/cpu/shim_draw_texture.hlsl VERBATIM)
+        target_sources(cpu_shim_draw PRIVATE "${header}")
+    endforeach()
     add_dependencies(cpu_shim_draw triangle_headers)
     target_sources(cpu_shim_draw PRIVATE
         "${shim_draw_color_header}"
@@ -1897,8 +1913,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:d3d12_xs_shim>" "$<TARGET_FILE:cpu_shim_draw>")
         set_tests_properties(cpu_shim_draw_${adapter} PROPERTIES TIMEOUT 180
             ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter};X2W_SHIM_COMPUTE_CASE=")
+        add_test(NAME cpu_shim_texture_reuse_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/shim_draw_check.py"
+            "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_shim_startup>" "$<TARGET_FILE:cpu_shim_startup_lifted>"
+            "$<TARGET_FILE:cpu_shim_startup_guest>" "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:xmem_shim>"
+            "$<TARGET_FILE:d3d12_xs_shim>" "$<TARGET_FILE:cpu_shim_draw>" --texture-reuse)
+        set_tests_properties(cpu_shim_texture_reuse_${adapter} PROPERTIES TIMEOUT 180
+            ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${adapter};X2W_SHIM_COMPUTE_CASE=")
     endforeach()
-    set_tests_properties(cpu_shim_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(cpu_shim_draw_hardware cpu_shim_texture_reuse_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
     add_test(NAME cpu_native_exe_chain COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/mapped_exe_chain_check.py" "$<TARGET_FILE:pe_map>"

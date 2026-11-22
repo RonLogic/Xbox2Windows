@@ -22,13 +22,43 @@ SIDE = 64
 BYTES = SIDE * SIDE * 4
 
 
+class FrameMismatch(AssertionError):
+    pass
+
+
+def covered(x, y):
+    return x >= 8 and y >= 8 and x + y <= 63
+
+
 def reference(red=False):
     out = bytearray()
     for y in range(SIDE):
         for x in range(SIDE):
-            inside = x >= 8 and y >= 8 and x + y <= 63
+            inside = covered(x, y)
             out += bytes((255 if inside and red else 0, 255 if inside and not red else 0, 0, 255))
     return bytes(out)
+
+
+def texture_reference(*, updated=False, swap=False):
+    colors = ((255, 0, 0, 255), (255, 0, 255, 255) if updated else (0, 255, 0, 255),
+              (0, 0, 255, 255), (255, 255, 0, 255))
+    out = bytearray()
+    for y in range(SIDE):
+        for x in range(SIDE):
+            r, g, b, a = colors[2 * (y >= 24) + (x >= 24)] if covered(x, y) else (0, 0, 0, 255)
+            out += bytes((b, g, r, a) if swap else (r, g, b, a))
+    return bytes(out)
+
+
+def compare_frames(actual, expected):
+    check("frame byte count", len(actual), len(expected))
+    if actual != expected:
+        byte = next(i for i, (a, b) in enumerate(zip(actual, expected)) if a != b)
+        frame, offset = divmod(byte, BYTES)
+        y, x = divmod(offset // 4, SIDE)
+        start = byte - offset % 4
+        raise FrameMismatch(f"stage {frame + 1} pixel ({x}, {y}): "
+                            f"expected {tuple(expected[start:start+4])}, actual {tuple(actual[start:start+4])}")
 
 
 def verify(case, result, expected_pixels):
@@ -38,6 +68,23 @@ def verify(case, result, expected_pixels):
         check("unknown draw case exits", result.returncode, 21)
         check("unknown draw case publishes nothing", pixels, b"")
         return None
+    if case in ("texture", "texture-stale"):
+        check(f"{case} exit code", result.returncode, 42)
+        first = texture_reference()
+        expected = first + texture_reference(updated=True) + texture_reference(updated=True, swap=True)
+        if case == "texture":
+            compare_frames(pixels, expected)
+        else:
+            try:
+                compare_frames(pixels, expected)
+            except FrameMismatch as error:
+                check("stale update diagnostic", str(error),
+                      "stage 2 pixel (24, 8): expected (255, 0, 255, 255), actual (0, 255, 0, 255)")
+                print(f"Stale update rejected: {error}")
+            else:
+                raise AssertionError("The previous texture pattern escaped detection")
+            compare_frames(pixels, first * 2 + texture_reference(swap=True))
+        return pixels
     if case in ("two", "stale", "fail-second"):
         frames, status = {
             "two": (expected_pixels + reference(red=True), 42),
@@ -45,12 +92,7 @@ def verify(case, result, expected_pixels):
             "fail-second": (expected_pixels, 24),
         }[case]
         check(f"{case} exit code", result.returncode, status)
-        check(f"{case} frame bytes", len(pixels), len(frames))
-        if pixels != frames:
-            byte = next(i for i, (actual, expected) in enumerate(zip(pixels, frames)) if actual != expected)
-            frame, offset = divmod(byte, BYTES)
-            y, x = divmod(offset // 4, SIDE)
-            raise AssertionError(f"{case} frame {frame + 1} pixel ({x}, {y}) differs from reference")
+        compare_frames(pixels, frames)
         return pixels
     check("draw publishes a full frame", len(pixels), BYTES)
     if case == "flip":
@@ -63,14 +105,15 @@ def verify(case, result, expected_pixels):
     return pixels
 
 
-def compare(mapper, exe, lifted, companion, io, xmem, d3d12):
+def compare(mapper, exe, lifted, companion, io, xmem, d3d12, *, texture_reuse=False):
     digest = reference()
     green = sum(1 for i in range(0, BYTES, 4) if digest[i + 1] == 255)
     print(f"draw frame: {SIDE}x{SIDE} RGBA ({BYTES} bytes); CPU rule holds {green} green pixels")
     map_command = [sys.executable, "-B", Path(__file__).with_name("shim_startup_check.py"), "--map",
                    mapper, exe, companion, io, xmem, d3d12, ""]
     markers = sorted(f"bound {dll}!{symbol}" for dll, symbols in SHIM_IMPORTS.items() for symbol in symbols)
-    for case in ("draw", "flip", "bogus", "two", "stale", "fail-second"):
+    cases = ("texture", "texture-stale") if texture_reuse else ("draw", "flip", "bogus", "two", "stale", "fail-second")
+    for case in cases:
         env = dict(os.environ, X2W_SHIM_DRAW_CASE="" if case == "bogus" else case,
                    X2W_SHIM_COMPUTE_CASE="")
         if case == "bogus":
@@ -82,9 +125,13 @@ def compare(mapper, exe, lifted, companion, io, xmem, d3d12):
             trace = ["draw_frame mode=3", "draw fence completed 1", f"draw_frame mode={second}"]
             if case != "fail-second":
                 trace.append("draw fence completed 2")
+        elif texture_reuse:
+            modes = (7, 8 if case == "texture" else 10, 9)
+            trace = [line for i, mode in enumerate(modes, 1)
+                     for line in (f"draw_frame mode={mode}", f"draw fence completed {i}")]
         for runner, command in (("native", [exe]), ("pe_map", map_command), ("AOT", [lifted])):
             child = subprocess.run(command, env=env, capture_output=True, timeout=120)
-            if case == "draw" and runner == "native" and child.returncode == 77:
+            if case == cases[0] and runner == "native" and child.returncode == 77:
                 raise SystemExit(77)
             lines = child.stderr.decode(errors="replace").splitlines()
             if runner == "pe_map":
@@ -102,11 +149,14 @@ def compare(mapper, exe, lifted, companion, io, xmem, d3d12):
         if case != "bogus":
             check(f"{case} runners agree",
                   (outputs["native"], outputs["AOT"]), (outputs["pe_map"], outputs["pe_map"]))
-        print(f"{case}: exits checked; "
-              f"pixels={len(outputs['native']) if outputs['native'] else 0}")
+        print(f"{case}: exits checked; rgba_bytes={len(outputs['native'] or b'')}")
 
 
 if __name__ == "__main__":
     # The draw provider path is passed so the test depends on its build; the guest
     # locates it next to the EXE, like the compute provider.
-    compare(*map(Path, sys.argv[1:-1]))
+    args = sys.argv[1:]
+    texture_reuse = args[-1] == "--texture-reuse"
+    if texture_reuse:
+        args.pop()
+    compare(*map(Path, args[:-1]), texture_reuse=texture_reuse)

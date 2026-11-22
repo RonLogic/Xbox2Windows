@@ -43,6 +43,8 @@ draw_phase:
     call qword ptr [__imp_draw_request]
     test eax, eax
     jz success
+    cmp eax, 7
+    jae draw_texture
     cmp eax, 3
     jae draw_two
     mov ecx, eax
@@ -61,6 +63,22 @@ draw_two:
     call qword ptr [__imp_draw_frame]
     cmp eax, -1
     je bad_second_draw
+    test eax, eax
+    jnz bad_draw
+    jmp success
+draw_texture:
+    mov dword ptr [rsp+48], eax
+    mov ecx, 7
+    call qword ptr [__imp_draw_frame]
+    test eax, eax
+    jnz bad_draw
+    mov ecx, dword ptr [rsp+48]
+    add ecx, 1
+    call qword ptr [__imp_draw_frame]
+    test eax, eax
+    jnz bad_draw
+    mov ecx, 9
+    call qword ptr [__imp_draw_frame]
     test eax, eax
     jnz bad_draw
 success:

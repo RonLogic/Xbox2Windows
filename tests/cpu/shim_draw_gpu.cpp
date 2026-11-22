@@ -17,6 +17,9 @@
 #include <vector>
 
 #include "shim_draw_color.h"
+#include "shim_draw_texture_init.h"
+#include "shim_draw_texture_read.h"
+#include "shim_draw_texture_swap.h"
 #include "triangle_vs.h"
 #include "triangle_ps.h"
 #include "triangle_vs_flip.h"
@@ -26,6 +29,7 @@ namespace {
 using Microsoft::WRL::ComPtr;
 
 constexpr UINT side = 64;
+enum class TextureStep { none, initialize, update, stale, reuse };
 
 void require(HRESULT hr, const char* operation)
 {
@@ -74,14 +78,20 @@ ComPtr<ID3D12Device> create_device()
 }
 class DrawSession {
 public:
-    DrawSession(bool flip, bool persistent) : device(create_device()), uses_color(persistent)
+    DrawSession(bool flip, bool persistent, bool textured = false) : device(create_device()), uses_color(persistent)
     {
         D3D12_ROOT_SIGNATURE_DESC root_desc{};
         root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
         D3D12_ROOT_PARAMETER color{};
-        if (uses_color) {
+        D3D12_DESCRIPTOR_RANGE texture_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+        if (textured) {
+            color.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            color.DescriptorTable = {1, &texture_range};
+        } else if (uses_color) {
             color.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
             color.Constants = {0, 0, 4};
+        }
+        if (uses_color || textured) {
             color.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
             root_desc.NumParameters = 1;
             root_desc.pParameters = &color;
@@ -101,6 +111,7 @@ public:
             pso.PS = {triangle_ps, sizeof(triangle_ps)};
         }
         if (uses_color) pso.PS = {shim_draw_color, sizeof(shim_draw_color)};
+        if (textured) pso.PS = {shim_draw_texture_read, sizeof(shim_draw_texture_read)};
         const D3D12_INPUT_ELEMENT_DESC elements[] = {
             {"SV_Position", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
             {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -119,6 +130,10 @@ public:
         pso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         pso.SampleDesc.Count = 1;
         require(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&pipeline)), "Create draw pipeline");
+        if (textured) {
+            pso.PS = {shim_draw_texture_swap, sizeof(shim_draw_texture_swap)};
+            require(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&swap_pipeline)), "Create texture reuse pipeline");
+        }
 
         D3D12_RESOURCE_DESC tex{};
         tex.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -133,6 +148,7 @@ public:
         D3D12_HEAP_PROPERTIES target_heap{};
         target_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         target_heap.CreationNodeMask = target_heap.VisibleNodeMask = 1;
+        if (textured) setup_texture(tex, target_heap);
         require(device->CreateCommittedResource(&target_heap, D3D12_HEAP_FLAG_NONE, &tex,
                                                 D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
                                                 IID_PPV_ARGS(&target)), "Create draw target");
@@ -165,17 +181,20 @@ public:
         require(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create draw fence");
     }
 
-    void render(bool red, std::vector<unsigned char>& rgba)
+    void render(bool red, std::vector<unsigned char>& rgba, TextureStep step = TextureStep::none)
     {
         rgba.resize(side * side * 4);
         if (submitted_frames) {
             require(allocator->Reset(), "Reset draw allocator");
             require(list->Reset(allocator.Get(), pipeline.Get()), "Reset draw command list");
-            transition(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            transition(target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         }
+        if (step != TextureStep::none) record_texture(step);
         const D3D12_VIEWPORT viewport{0, 0, side, side, 0, 1};
         const D3D12_RECT scissor{0, 0, side, side};
         list->SetGraphicsRootSignature(root.Get());
+        if (step != TextureStep::none)
+            list->SetGraphicsRootDescriptorTable(0, texture_descriptors->GetGPUDescriptorHandleForHeapStart());
         if (uses_color) {
             const float color[]{red ? 1.0f : 0.0f, red ? 0.0f : 1.0f, 0.0f, 1.0f};
             list->SetGraphicsRoot32BitConstants(0, 4, color, 0);
@@ -187,7 +206,7 @@ public:
         list->ClearRenderTargetView(rtv, clear, 0, nullptr);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->DrawInstanced(3, 1, 0, 0);
-        transition(D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition(target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_TEXTURE_COPY_LOCATION src{};
         src.pResource = target.Get();
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -214,16 +233,72 @@ public:
         }
         const D3D12_RANGE no_writes{0, 0};
         readback->Unmap(0, &no_writes);
-        if (uses_color)
+        if (uses_color || step != TextureStep::none)
             std::fprintf(stderr, "draw fence completed %llu\n", static_cast<unsigned long long>(submitted_frames));
     }
 
 private:
-    void transition(D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+    void setup_texture(D3D12_RESOURCE_DESC tex, const D3D12_HEAP_PROPERTIES& heap)
+    {
+        tex.Width = tex.Height = 2;
+        tex.Format = DXGI_FORMAT_R32_UINT;
+        tex.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        require(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &tex,
+                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                IID_PPV_ARGS(&texture)), "Create persistent texture");
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+                                             D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        require(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&texture_descriptors)), "Create texture views heap");
+        const UINT increment = device->GetDescriptorHandleIncrementSize(desc.Type);
+        const auto cpu = texture_descriptors->GetCPUDescriptorHandleForHeapStart();
+        device->CreateShaderResourceView(texture.Get(), nullptr, cpu);
+        device->CreateUnorderedAccessView(texture.Get(), nullptr, nullptr, {cpu.ptr + increment});
+        compute_view = {texture_descriptors->GetGPUDescriptorHandleForHeapStart().ptr + increment};
+
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[0].DescriptorTable = {1, &range};
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[1].Constants = {0, 0, 1};
+        const D3D12_ROOT_SIGNATURE_DESC layout{2, params};
+        ComPtr<ID3DBlob> blob;
+        require(D3D12SerializeRootSignature(&layout, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr),
+                "Serialize texture compute root");
+        require(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                            IID_PPV_ARGS(&compute_root)), "Create texture compute root");
+        D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
+        compute.pRootSignature = compute_root.Get();
+        compute.CS = {shim_draw_texture_init, sizeof(shim_draw_texture_init)};
+        require(device->CreateComputePipelineState(&compute, IID_PPV_ARGS(&compute_pipeline)),
+                "Create texture compute pipeline");
+    }
+
+    void record_texture(TextureStep step)
+    {
+        ID3D12DescriptorHeap* heaps[]{texture_descriptors.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+        if (step == TextureStep::initialize || step == TextureStep::update) {
+            const UINT partial = step == TextureStep::update;
+            if (partial)
+                transition(texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            list->SetPipelineState(compute_pipeline.Get());
+            list->SetComputeRootSignature(compute_root.Get());
+            list->SetComputeRootDescriptorTable(0, compute_view);
+            list->SetComputeRoot32BitConstant(1, partial, 0);
+            list->Dispatch(1, 1, 1);
+            transition(texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+        list->SetPipelineState(step == TextureStep::reuse ? swap_pipeline.Get() : pipeline.Get());
+    }
+
+    void transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
     {
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition = {target.Get(), 0, before, after};
+        barrier.Transition = {resource, 0, before, after};
         list->ResourceBarrier(1, &barrier);
     }
 
@@ -236,6 +311,11 @@ private:
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12Fence> fence;
+    ComPtr<ID3D12Resource> texture;
+    ComPtr<ID3D12DescriptorHeap> texture_descriptors;
+    ComPtr<ID3D12RootSignature> compute_root;
+    ComPtr<ID3D12PipelineState> compute_pipeline, swap_pipeline;
+    D3D12_GPU_DESCRIPTOR_HANDLE compute_view{};
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
     UINT64 byte_count = 0;
@@ -246,22 +326,25 @@ private:
 
 bool shim_draw_gpu(unsigned mode, std::vector<unsigned char>& rgba)
 {
-    // Only the two-frame fixture carries state across draw_frame calls on the guest thread.
-    static thread_local std::unique_ptr<DrawSession> first_frame;
+    static thread_local std::unique_ptr<DrawSession> pending;
     try {
         if (mode < 3) {
             DrawSession(mode == 2, false).render(false, rgba);
-        } else if (mode == 3) {
-            first_frame = std::make_unique<DrawSession>(false, true);
-            first_frame->render(false, rgba);
+        } else if (mode == 3 || mode == 7) {
+            const bool textured = mode == 7;
+            pending = std::make_unique<DrawSession>(false, !textured, textured);
+            pending->render(false, rgba, textured ? TextureStep::initialize : TextureStep::none);
+        } else if (mode == 8 || mode == 10) {
+            if (!pending) return false;
+            pending->render(false, rgba, mode == 8 ? TextureStep::update : TextureStep::stale);
         } else {
-            auto session = std::move(first_frame);
+            auto session = std::move(pending);
             if (!session || mode == 6) return false;
-            session->render(mode == 4, rgba);
+            session->render(mode == 4, rgba, mode == 9 ? TextureStep::reuse : TextureStep::none);
         }
         return true;
     } catch (HRESULT) {
-        first_frame.reset();
+        pending.reset();
         return false;
     }
 }

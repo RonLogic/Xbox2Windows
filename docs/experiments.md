@@ -145,9 +145,24 @@ return two green frames and exit 20. Argument 6 fails before the second
 submission. That control must publish just the first frame, report just fence
 1 and exit 24. The mapped host must regain control in all three cases.
 
+`cpu_shim_texture_reuse` extends the same EXE with three fenced draws. One
+compute dispatch fills a 2×2 `R32_UINT` texture with packed RGBA8 colors.
+The second dispatch changes only texel (1, 0), from green to magenta. The
+other three texels serve as guards. Both draws load from the same texture
+SRV. The second dispatch transitions that resource from pixel-shader-resource
+to UAV, then back before rasterization. The third draw leaves the texture in
+pixel-shader-resource state and uses a second pipeline to swap red and blue.
+
+Each runner checks the full 64×64 readback after fence values 1, 2 and 3.
+Pixels (12, 12), (30, 12), (12, 30) and (30, 30) observe the four texels.
+The stale control skips the partial dispatch. Comparing it against the
+updated reference must report the first mismatch at stage 2, pixel (24, 8),
+with expected magenta and actual green. The control also checks the full
+unchanged second frame and the channel-swapped third frame.
+
 ```powershell
 cmake --build --preset dev --target cpu_shim_startup cpu_shim_startup_lifted pe_map
-ctest --preset dev --no-tests=error -R '^cpu_shim_draw_(warp|hardware)$' -V
+ctest --preset dev --no-tests=error -R '^cpu_shim_(draw|texture_reuse)_(warp|hardware)$' -V
 ```
 
 ## Source-built EXE entry to a DLL import

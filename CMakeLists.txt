@@ -1845,8 +1845,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_compile_features(cpu_shim_compute PRIVATE cxx_std_17)
     target_link_libraries(cpu_shim_compute PRIVATE xmem_shim dxgi d3d12)
     add_library(cpu_shim_draw SHARED tests/cpu/shim_draw_provider.cpp tests/cpu/shim_draw_gpu.cpp)
+    set(shim_draw_color_header "${CMAKE_CURRENT_BINARY_DIR}/shim_draw_color.h")
+    add_custom_command(OUTPUT "${shim_draw_color_header}"
+        COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E main -Fh "${shim_draw_color_header}" -Vn shim_draw_color
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/shim_draw_color.hlsl"
+        DEPENDS tests/cpu/shim_draw_color.hlsl VERBATIM)
     add_dependencies(cpu_shim_draw triangle_headers)
     target_sources(cpu_shim_draw PRIVATE
+        "${shim_draw_color_header}"
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs.h"
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_ps.h"
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs_flip.h"

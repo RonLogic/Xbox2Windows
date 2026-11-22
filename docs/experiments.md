@@ -133,9 +133,21 @@ still agrees across runners; an unknown draw case must exit 21 with no frame.
 The non-mirrored shader object is unchanged, so the existing triangle draws are
 unaffected.
 
+For the two-frame case, the guest calls the same draw import twice, with
+arguments 3 and 4. The provider keeps one device, direct queue, graphics
+pipeline, render target and readback resource. It waits for the first fence
+before resetting the command allocator and rebinding the pixel shader's root
+constants. All three runners must publish the green triangle followed by a
+red triangle. The check compares all 16,384 RGBA bytes per frame with an
+independent raster reference and requires completed fence values 1 and 2.
+The stale-input control changes the second import argument to 5 and must
+return two green frames and exit 20. Argument 6 fails before the second
+submission. That control must publish just the first frame, report just fence
+1 and exit 24. The mapped host must regain control in all three cases.
+
 ```powershell
 cmake --build --preset dev --target cpu_shim_startup cpu_shim_startup_lifted pe_map
-ctest --preset dev --no-tests=error -R '^cpu_shim_draw_warp$' -V
+ctest --preset dev --no-tests=error -R '^cpu_shim_draw_(warp|hardware)$' -V
 ```
 
 ## Source-built EXE entry to a DLL import

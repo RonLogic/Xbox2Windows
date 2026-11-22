@@ -50,7 +50,52 @@ def check_forwarder_bounds(mapper, original, directory):
             mapper.release(mapped)
 
 
-def main(mapper_path, forwarder, provider):
+def check_windows_ordinal(mapper, original, provider, directory):
+    target = directory / provider.name
+    shutil.copyfile(provider, target)
+    module = ctypes.CDLL(str(target))
+    expected = kernel.GetProcAddress(module._handle, 77)
+    assert expected and not kernel.GetProcAddress(module._handle, b"mix_args")
+
+    image = bytearray(original.read_bytes())
+    with pefile.PE(data=bytes(image)) as pe:
+        entry = next(e for e in pe.DIRECTORY_ENTRY_EXPORT.symbols if e.name == b"mix_args")
+        offset = pe.get_offset_from_rva(entry.address)
+        capacity = len(entry.forwarder) + 1
+    module_name = provider.stem.encode("ascii")
+    forwarder = module_name + b".#77\0"
+    assert len(forwarder) <= capacity
+    image[offset:offset + capacity] = forwarder.ljust(capacity, b"\0")
+    ordinal_copy = directory / "ordinal_forwarder.dll"
+    ordinal_copy.write_bytes(image)
+
+    native = kernel.LoadLibraryExW(str(ordinal_copy), None, LOAD_SEARCH)
+    if not native:
+        raise AssertionError(f"ordinal LoadLibraryExW failed with {ctypes.get_last_error()}")
+    try:
+        assert kernel.GetProcAddress(native, b"mix_args") == expected
+    finally:
+        kernel.FreeLibrary(native)
+
+    calls = []
+
+    @Resolver
+    def resolve(dll, name, ordinal):
+        calls.append((dll, name, ordinal))
+        return kernel.GetProcAddress(module._handle, ordinal) if dll == module_name and name is None else None
+
+    base, status, detail, _ = mapper(ordinal_copy, {})
+    if not base or status != STATUS["ok"]:
+        raise AssertionError(f"ordinal map failed with {status}: {detail}")
+    try:
+        assert mapper.resolved(base, b"mix_args", resolve) == expected
+        assert calls == [(module_name, None, 77)], calls
+    finally:
+        mapper.release(base)
+    print(f"{module_name.decode()}.#77: Windows and pe_map resolved the same NONAME export")
+
+
+def main(mapper_path, forwarder, provider, ordinal_provider):
     mapper = Mapper(mapper_path)
     # The provider stays loaded until the process exits, so its copy cannot be deleted here.
     with TemporaryDirectory(ignore_cleanup_errors=True) as temp:
@@ -81,6 +126,7 @@ def main(mapper_path, forwarder, provider):
             return kernel.GetProcAddress(target._handle, name if name else ordinal) if target else None
 
         check_forwarder_bounds(mapper, forwarder_copy, Path(temp))
+        check_windows_ordinal(mapper, forwarder_copy, ordinal_provider, Path(temp))
         callback = Resolver(resolve)
         base, status, detail, _ = mapper(forwarder_copy, {})
         if not base or status != STATUS["ok"]:
@@ -109,4 +155,4 @@ def main(mapper_path, forwarder, provider):
 
 
 if __name__ == "__main__":
-    sys.exit(main(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])))
+    sys.exit(main(*map(Path, sys.argv[1:])))

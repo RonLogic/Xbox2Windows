@@ -1856,7 +1856,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_link_libraries(cpu_forwarder PRIVATE cpu_import_provider)
     add_test(NAME cpu_native_forwarder COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/forwarder_check.py" "$<TARGET_FILE:pe_map>"
-        "$<TARGET_FILE:cpu_forwarder>" "$<TARGET_FILE:cpu_import_provider>")
+        "$<TARGET_FILE:cpu_forwarder>" "$<TARGET_FILE:cpu_import_provider>"
+        "$<TARGET_FILE:cpu_ordinal_provider>")
     cpu_asm_fixture(cpu_seh_original seh_route)
     add_test(NAME cpu_native_seh COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_seh_check.py" "$<TARGET_FILE:cpu_seh_original>"

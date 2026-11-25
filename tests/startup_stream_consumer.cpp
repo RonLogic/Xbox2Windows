@@ -164,7 +164,7 @@ static void* desktop_pipeline(void* device)
 //   stateb-unreadable, desc-unreadable
 //   dispatch, dispatch-swapped, dispatch-none, dispatch-sampled, dispatch-sampled-unbound: one creation, then
 //   dispatch_slot67 below
-//   texture-store, texture-store-none, texture-store-denied: one creation, then texture_slot67 below
+//   texture-store modes: one creation, then texture_slot67 below
 // The unreadable cases point at a PAGE_NOACCESS page; code-past-end ends the code on the last byte before one.
 static void* slot67_pipeline;
 static void* slot67_root;
@@ -277,14 +277,20 @@ static int dispatch_slot67(void* device, const std::string& mode)
 // three root constants, Dispatch of 2x1x1 groups, and the texture copied to a readback buffer whose 1024 halves go
 // to X2W_TEST_DISPATCH_OUT. texture-store-none records no Dispatch; texture-store-denied creates the texture
 // without unordered access, so the stand-in records its view as not created.
+// texture-store-mips adds a second UAV of the same texture. The swapped mode reverses the two mip views.
 static int texture_slot67(void* device, const std::string& mode)
 {
-    constexpr UINT width = 32, height = 8, pitch = width * 8, bytes = pitch * height;
+    constexpr UINT width = 32, height = 8, pixel_bytes = 8, pitch = width * pixel_bytes;
+    const bool swapped = mode == "texture-store-mips-swapped";
+    const bool dual = swapped || mode == "texture-store-mips";
+    const UINT16 mips = dual ? 2 : 1;
+    const UINT bytes = pitch * (height + (dual ? height / 2 : 0));
+    const auto mip_offset = [&](UINT mip) { return mip ? pitch * height : 0; };
     const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
     const auto make = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
         return make_committed(device, type, desc, state);
     };
-    const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, mips, DXGI_FORMAT_R16G16B16A16_FLOAT,
         {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
         mode == "texture-store-denied" ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     const D3D12_RESOURCE_DESC buffer_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
@@ -294,12 +300,18 @@ static int texture_slot67(void* device, const std::string& mode)
     void* const readback = make(D3D12_HEAP_TYPE_READBACK, buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST);
     void* memory = nullptr;
     if (!texture || !upload || !readback || FAILED(static_cast<HRESULT>(invoke(upload, 8, 0, 0, word(&memory)))) || !memory) return 71;
-    for (UINT i = 0; i < bytes / 2; ++i) static_cast<UINT16*>(memory)[i] = static_cast<UINT16>(0x5000 + i);
+    for (UINT mip = 0; mip < mips; ++mip) {
+        const UINT row_halves = (width >> mip) * (pixel_bytes / sizeof(UINT16));
+        auto* start = reinterpret_cast<UINT16*>(static_cast<char*>(memory) + mip_offset(mip));
+        for (UINT y = 0; y < (height >> mip); ++y)
+            for (UINT x = 0; x < row_halves; ++x)
+                start[y * pitch / sizeof(UINT16) + x] = static_cast<UINT16>(0x5000 + 0x400 * mip + y * row_halves + x);
+    }
     invoke(upload, 9, 0, 0);
     const struct {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         UINT64 backing, bytes;
-    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, dual ? 5u : 4u, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
     void *heap = nullptr, *queue = nullptr, *allocator = nullptr, *list = nullptr, *fence = nullptr;
     const D3D12_COMMAND_QUEUE_DESC queue_desc{};
     const UINT list_desc[]{D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
@@ -310,23 +322,32 @@ static int texture_slot67(void* device, const std::string& mode)
         FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&fence))))) return 72;
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     if (!cpu || !gpu) return 73;
-    const D3D12_UNORDERED_ACCESS_VIEW_DESC view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D};
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D};
+    view.Texture2D.MipSlice = swapped ? 1 : 0;
     invoke(device, 19, word(texture), 0, word(&view), cpu + 64);
-    D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    source.PlacedFootprint = {0, {DXGI_FORMAT_R16G16B16A16_FLOAT, width, height, 1, pitch}};
-    D3D12_TEXTURE_COPY_LOCATION result = source;
-    result.pResource = static_cast<ID3D12Resource*>(readback);
+    if (dual) {
+        view.Texture2D.MipSlice = swapped ? 0 : 1;
+        invoke(device, 19, word(texture), 0, word(&view), cpu + 128);
+    }
+    const auto transfer = [&](void* buffer, bool to_texture) {
+        for (UINT mip = 0; mip < mips; ++mip) {
+            D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            image.SubresourceIndex = mip;
+            D3D12_TEXTURE_COPY_LOCATION rows{static_cast<ID3D12Resource*>(buffer), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            rows.PlacedFootprint = {mip_offset(mip), {DXGI_FORMAT_R16G16B16A16_FLOAT, width >> mip, height >> mip, 1, pitch}};
+            invoke(list, 16, word(to_texture ? &image : &rows), 0, 0, 0, word(to_texture ? &rows : &image), 0);
+        }
+    };
     const UINT constants[3] = {1, 2, 3};
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
     invoke(list, 32, 1, word(&heap));
-    invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
+    transfer(upload, true);
     invoke(list, 25, word(slot67_pipeline));
     invoke(list, 33, word(slot67_root));
     invoke(list, 39, 0, 3, word(constants), 0);
     invoke(list, 35, 1, gpu);
     if (mode != "texture-store-none") invoke(list, 14, 2, 1, 1);
-    invoke(list, 16, word(&result), 0, 0, 0, word(&image), 0);
+    transfer(readback, false);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
@@ -339,9 +360,12 @@ static int texture_slot67(void* device, const std::string& mode)
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
     memory = nullptr;
     if (!n || n >= MAX_PATH || FAILED(static_cast<HRESULT>(invoke(readback, 8, 0, 0, word(&memory)))) || !memory) return 2;
-    std::ofstream(path, std::ios::binary).write(static_cast<const char*>(memory), bytes);
+    std::ofstream output(path, std::ios::binary);
+    for (UINT mip = 0; mip < mips; ++mip)
+        for (UINT y = 0; y < (height >> mip); ++y)
+            output.write(static_cast<const char*>(memory) + mip_offset(mip) + y * pitch, (width >> mip) * pixel_bytes);
     invoke(readback, 9, 0, 0);
-    return 0;
+    return output ? 0 : 2;
 }
 
 static bool create_slot67(void* device, const char* code_path, const char* data_path, const char* state_path, const char* mode)

@@ -1,6 +1,6 @@
 """Translated compute programs with 2D texture views, dispatched through the stand-in's command list (slot 14).
 
-usage: startup_compute_dispatch_texture_check.py <startup_stream_consumer> <dxc> <warp|hardware>
+usage: startup_compute_dispatch_texture_check.py <startup_stream_consumer> <dxc> <warp|hardware> [two-mips]
 
 Texture output: the consumer creates the image store program of startup_compute_image_store_d16_check.py as a
 device slot 67 pipeline, fills a 32x8 RGBA16_FLOAT texture with sentinel halves, creates an unordered access view of
@@ -19,6 +19,7 @@ stored word (a static sampler, a texture view at table byte 64). The consumer ad
 is 1.0 and a shader resource view of it (device slot 18). After translation all 320 words equal the case's
 expectation XOR the bits of 1.0f; dispatch-sampled-unbound (no view created) is refused with one logged reason and
 every word keeps the sentinel.
+The two-mips mode writes two different patterns through separate UAVs of the same texture, then swaps the views.
 Exit 77 when the adapter is not available.
 """
 import os
@@ -113,6 +114,82 @@ def store(directory, consumer, dxc, env):
           f'untouched before translation, without a Dispatch and for a refused view; debug layer: {layer}')
 
 
+# A second descriptor, at table byte 128, and a different color in v14.
+SECOND_STORE = bytes.fromhex(
+    '06080cf4 800000fa '  # s_load_dwordx8 s[32:39], s[12:13], 0x80
+    '7fc08cbf '           # s_waitcnt lgkmcnt(0)
+    'ff021c7e 00bc0044 ' # v_mov_b32_e32 v14, 0x4400bc00
+    '080f20f0 080e0880'  # image_store v[14:15], v[8:9], s[32:39] dmask:0xf dim:SQ_RSRC_IMG_2D d16
+)
+MIPS = ((32, 8), (16, 4))
+
+
+def mip_reference(colors):
+    halves = []
+    for mip, ((width, height), color) in enumerate(zip(MIPS, colors, strict=True)):
+        for y in range(height):
+            for x in range(width):
+                sentinel = 0x5000 + 0x400 * mip + 4 * (y * width + x)
+                if color is None or x >= 8 or y >= 2:
+                    halves.extend(range(sentinel, sentinel + 4))
+                else:
+                    tag = 8 * y + x
+                    rg = (0x3c00 + tag, 0xc000 + tag) if color == 0 else (0xbc00, 0x4400)
+                    halves.extend((*rg, tag, 0x8000 + tag))
+    return halves
+
+
+def check_mips(label, got, expected):
+    start = 0
+    for mip, (width, height) in enumerate(MIPS):
+        for index in range(width * height * 4):
+            actual, wanted = got[start + index], expected[start + index]
+            pixel, channel = divmod(index, 4)
+            y, x = divmod(pixel, width)
+            assert actual == wanted, (f'{label}: mip={mip} x={x} y={y} channel={channel} '
+                                      f'expected={wanted:04x} actual={actual:04x}')
+        start += width * height * 4
+
+
+def store_two_mips(directory, consumer, dxc, env):
+    cache, base = prepare(directory)
+    root = C.root_blob(3, table_range=True)
+    (directory / 'compute_root').write_bytes(root)
+    env = dict(base, **env, X2W_TEST_COMPUTE_ROOT=str(directory / 'compute_root'))
+    code = S.PREFIX + S.STORE + SECOND_STORE + S.END
+    pipeline = G.ComputePipeline(code, root, S.RSRC2, S.fixture.GROUP)
+    outputs = [line for line in pipeline.manifest().splitlines() if line.startswith('uav ')]
+    assert outputs == [
+        'uav 0 tex2d float table 1 64 channels 4',
+        'uav 1 tex2d float table 1 128 channels 4',
+    ], outputs
+    (directory / 'program').write_bytes(code)
+    (directory / 'data').write_bytes(DATA)
+    (directory / 'state').write_bytes(state_a(S.fixture.GROUP, S.RSRC2))
+    untouched = mip_reference((None, None))
+    layout = '<%dH' % len(untouched)
+
+    got, result = run(directory, consumer, env, 'texture-store-mips', layout)
+    print(result.stdout, end='')
+    check_mips('missing translation', got, untouched)
+    assert len(lines(result, 'Dispatch(2, 1, 1) refused: no translation')) == 1, result.stderr[-3000:]
+    key = int(lines(result, 'x2w-draw compute request')[0].split()[3], 16)
+    translate(cache, dxc, key)
+
+    expected = mip_reference((0, 1))
+    got, result = run(directory, consumer, env, 'texture-store-mips', layout)
+    check_mips('ordered views', got, expected)
+    assert len(lines(result, 'translated: 3 entry values, 0 inputs, 2 outputs')) == 1, result.stderr[-3000:]
+    layer = clean(result)
+
+    got, result = run(directory, consumer, env, 'texture-store-mips-swapped', layout)
+    check_mips('swapped views', got, mip_reference((1, 0)))
+    clean(result)
+    changed = sum(a != b for a, b in zip(got, expected, strict=True))
+    assert changed == 64, changed
+    print(f'two mip outputs: {len(got)} halves match; swapping views changes {changed} halves; debug layer: {layer}')
+
+
 # v_xor_b32 v5, v5, v12: the assembled `v_xor_b32 v5, v5, v6` of case A with its second source register changed
 # (not assembled by llvm-mc here; the translation below is checked to read it as written).
 XOR = 'v_xor_b32 v5, v5, v12'
@@ -164,17 +241,20 @@ def sample(directory, consumer, dxc, env):
           f'view; debug layer: {layer}')
 
 
-def main(consumer, dxc, adapter):
+def main(consumer, dxc, adapter, mode=None):
     env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
     if adapter == 'hardware':
         env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
     with tempfile.TemporaryDirectory() as temporary:
-        store(Path(temporary) / 'store', consumer, dxc, env)
-        sample(Path(temporary) / 'sample', consumer, dxc, env)
+        if mode == 'two-mips':
+            store_two_mips(Path(temporary) / 'mips', consumer, dxc, env)
+        else:
+            store(Path(temporary) / 'store', consumer, dxc, env)
+            sample(Path(temporary) / 'sample', consumer, dxc, env)
     print(f'startup_compute_dispatch_texture: PASS on {adapter}')
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 4 or sys.argv[3] not in ('warp', 'hardware'):
+    if len(sys.argv) not in (4, 5) or sys.argv[3] not in ('warp', 'hardware') or sys.argv[4:] not in ([], ['two-mips']):
         sys.exit(__doc__)
     main(*sys.argv[1:])

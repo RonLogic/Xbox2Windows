@@ -1383,7 +1383,20 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
         slot<Topology>(wrapped, 20)(wrapped, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         slot<Viewport>(wrapped, 21)(wrapped, 1, &viewport);
         slot<Scissor>(wrapped, 22)(wrapped, 1, &scissor);
+        ComPtr<ID3D12QueryHeap> occlusion;
+        ComPtr<ID3D12Resource> query_readback;
+        if (mode == Mode::depth_only) {
+            // No color target is bound. Count the samples that the indirect draw actually rasterizes.
+            const D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 0};
+            check(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&occlusion)), "create depth-only query heap");
+            query_readback = make_buffer(device, sizeof(UINT64), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->BeginQuery(occlusion.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+        }
         slot<Execute>(wrapped, 61)(wrapped, signature, 1, arguments.wrapped.Get(), argument_offset, nullptr, 0);
+        if (occlusion) {
+            list->EndQuery(occlusion.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+            list->ResolveQueryData(occlusion.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, 1, query_readback.Get(), 0);
+        }
         check(slot<HRESULT(WINAPI*)(IUnknown*)>(wrapped, 9)(wrapped), "close targets list");
 
         const D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -1400,6 +1413,21 @@ bool check_translated_targets(ID3D12Device* device, ID3D12Device* guest, ID3D12R
         check(fence->SetEventOnCompletion(1, done), "set targets fence event");
         WaitForSingleObject(done, INFINITE);
         CloseHandle(done);
+
+        if (query_readback) {
+            const D3D12_RANGE query_range{0, sizeof(UINT64)};
+            check(query_readback->Map(0, &query_range, &memory), "map depth-only query");
+            UINT64 samples = 0;
+            std::memcpy(&samples, memory, sizeof(samples));
+            query_readback->Unmap(0, &untouched);
+            constexpr UINT64 expected = UINT64{width} * height;
+            if (samples != expected) {
+                std::fprintf(stderr, "%s: got %llu occlusion samples, expected %llu\n", label,
+                             static_cast<unsigned long long>(samples), static_cast<unsigned long long>(expected));
+                return false;
+            }
+            std::printf("%s: %llu occlusion samples\n", label, static_cast<unsigned long long>(samples));
+        }
 
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
         UINT64 bytes = 0;

@@ -1698,6 +1698,7 @@ bool fixed_mesh_create_contract(ID3D12Device* guest)
     return true;
 }
 #include "startup_indirect_mesh_lease.inl"
+#include "startup_mesh57_runtime.inl"
 }  // namespace
 
 int main(int argc, char** argv) try
@@ -1722,6 +1723,7 @@ int main(int argc, char** argv) try
     else if (lease_fixture && !lease_arguments)
         check(SetEnvironmentVariableA("X2W_MESH86_XMEM_SRV", "1") ? S_OK : E_FAIL, "enable mesh XMem handoff");
     const bool console_mesh = argc == 3 && std::strcmp(argv[2], "mesh-console") == 0;
+    const bool runtime_mesh57 = argc == 3 && std::strcmp(argv[2], "mesh57-runtime") == 0;
     const bool desktop_as = argc == 3 && std::strcmp(argv[2], "mesh-amplified") == 0;
     const bool copy_on = argc == 3 && std::strcmp(argv[2], "copy-provenance") == 0;
     const bool copy_off = argc == 3 && std::strcmp(argv[2], "copy-provenance-off") == 0;
@@ -1740,7 +1742,7 @@ int main(int argc, char** argv) try
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
     else if (argc == 3 && std::strcmp(argv[2], "rect") == 0) kind = DrawKind::rect;
-    else if (lease_arguments || console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0))
+    else if (lease_arguments || console_mesh || desktop_as || runtime_mesh57 || (argc == 3 && std::strcmp(argv[2], "mesh") == 0))
         kind = DrawKind::mesh;
     else if (rect) kind = DrawKind::indexed_rect;
     else if (argc != 2 && !count_control && !translated_indexed && !lease_writer) return 2;
@@ -1778,7 +1780,7 @@ int main(int argc, char** argv) try
     wchar_t directory[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, directory)) return 4;
     const std::wstring log_path = std::wstring(directory) + L"x2w_indirect_counts_" + std::to_wstring(GetCurrentProcessId()) + L".log";
-    if (indexed || lease_arguments || dual_lease || loose_root || refusal_census || other_refusal_census) {
+    if (indexed || lease_arguments || dual_lease || loose_root || refusal_census || other_refusal_census || runtime_mesh57) {
         DeleteFileW(log_path.c_str());
         SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
         SetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", "0");
@@ -1824,6 +1826,14 @@ int main(int argc, char** argv) try
     const auto root_flags = mesh ? D3D12_ROOT_SIGNATURE_FLAG_NONE : D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     const D3D12_ROOT_SIGNATURE_DESC graphics_desc{0, nullptr, 0, nullptr, root_flags};
     const auto writer = create_root(device.Get(), writer_desc);
+    if (runtime_mesh57) {
+        wchar_t directory[MAX_PATH]{};
+        const DWORD size = GetEnvironmentVariableW(L"X2W_TEST_MESH57_EXCHANGE", directory, MAX_PATH);
+        check(size && size < MAX_PATH ? S_OK : E_FAIL, "get slot 57 fixture directory");
+        const bool ok = run_mesh57_runtime(device.Get(), guest.Get(), writer.Get(), directory, log_path);
+        check_lease_debug(info.Get());
+        return ok ? 0 : 1;
+    }
     wchar_t mesh86_dir[MAX_PATH]{};
     if (mesh && GetEnvironmentVariableW(L"X2W_MESH86_FIXTURE_DIR", mesh86_dir, MAX_PATH)) {
         const bool depth_only = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_DEPTH", nullptr, 0) != 0;
@@ -2012,17 +2022,10 @@ int main(int argc, char** argv) try
             std::filesystem::current_path() / ("slot57-mesh-" + std::to_string(GetCurrentProcessId()));
         std::filesystem::create_directory(cache);
         check(SetEnvironmentVariableW(L"X2W_SHADER_CACHE", cache.c_str()) ? S_OK : E_FAIL, "set mesh fixture cache");
-        const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
-        D3D12_ROOT_PARAMETER params[2]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants = {0, 0, 2};
-        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[1].DescriptorTable = {1, &srv};
-        const D3D12_ROOT_SIGNATURE_DESC source_root{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-        const auto& desc = exchange_size ? source_root : graphics_desc;
         ComPtr<ID3DBlob> root_blob;
-        const auto root = create_root(guest.Get(), desc, &root_blob);
-        const auto different_root = create_root(guest.Get(), desc);
+        const auto root = exchange_size ? mesh57_fixture_root(guest.Get(), &root_blob) :
+            create_root(guest.Get(), graphics_desc, &root_blob);
+        const auto different_root = exchange_size ? mesh57_fixture_root(guest.Get()) : create_root(guest.Get(), graphics_desc);
         // Distinct, source-owned bounded spans. The request publisher must preserve their stage roles and lengths.
         const std::array<UINT, 4> default_ms{0xbfa00003, 0xbf900009, 0xbf810000, 0};
         const std::array<UINT, 2> default_ps{0xbfa00003, 0xbf810000};
